@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/md5"
+	"flag"
 	"fmt"
 	"io/fs"
 	"log"
@@ -10,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -70,10 +72,26 @@ func isEqual(pattern string) bool {
 	return true
 }
 
-func runCommand() *exec.Cmd {
-	temp := exec.Command("go", "build", "-o=__temp__")
+func runCommand(build string, run string) *exec.Cmd {
+	var temp *exec.Cmd
+	var cmd *exec.Cmd
+	b := strings.Split(build, " ")
+	if len(b) > 1 {
+		temp = exec.Command(b[0], b[1:]...)
+	} else if len(b) == 1 {
+		temp = exec.Command(build)
+	} else {
+		log.Panic("Build command error", build)
+	}
 	temp.Run()
-	cmd := exec.Command("./__temp__")
+	r := strings.Split(run, " ")
+	if len(r) > 1 {
+		cmd = exec.Command(r[0], r[1:]...)
+	} else if len(r) == 1 {
+		cmd = exec.Command(run)
+	} else {
+		log.Panic("Run command error", run)
+	}
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Start()
@@ -81,27 +99,42 @@ func runCommand() *exec.Cmd {
 }
 
 func main() {
+	buildCmd := flag.String("build", "go build -o=__temp__", "Custom build command")
+	runCmd := flag.String("run", "./__temp__", "Custom run command")
+	tearDownCmd := flag.String("tearDown", "rm __temp__", "Custom tear down command")
+	fileTypes := flag.String("types", "go,htmp,css,js,tmpl", "File types to check for changes, Example: -types=go,html,js ")
+	flag.Parse()
+
 	// Teardown
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, os.Interrupt, os.Kill, syscall.SIGTERM)
 	go func() {
+		var cmd *exec.Cmd
 		signalType := <-ch
 		signal.Stop(ch)
 		fmt.Println("Exit command received. Exiting...", signalType)
-		os.Remove("temp")
+		c := strings.Split(*tearDownCmd, " ")
+		if len(c) > 1 {
+			cmd = exec.Command(c[0], c[1:]...)
+		} else if len(c) == 1 {
+			cmd = exec.Command(*tearDownCmd)
+		} else {
+			log.Panic("Build command error", cmd)
+		}
+		cmd.Run()
 		os.Exit(0)
 	}()
 
-	pattern := ".+\\.(go|tmpl|html)"
+	pattern := fmt.Sprintf(".+\\.(%s)", strings.ReplaceAll(*fileTypes, ",", "|"))
 	setup(pattern)
-	cmd := runCommand()
+	cmd := runCommand(*buildCmd, *runCmd)
 	for {
 		time.Sleep(time.Second * 1)
 		if !isEqual(pattern) {
 			fmt.Println("Update detected")
 			setup(pattern)
 			cmd.Process.Kill()
-			cmd = runCommand()
+			cmd = runCommand(*buildCmd, *runCmd)
 		}
 	}
 }
