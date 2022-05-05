@@ -99,7 +99,7 @@ func main() {
 	buildCmd := flag.String("build", "go build -o=__temp__", "Custom build command")
 	runCmd := flag.String("run", "./__temp__", "Custom run command")
 	tearDownCmd := flag.String("tearDown", "rm __temp__", "Custom teardown command")
-	fileTypes := flag.String("types", "go,htmp,css,js,tmpl", "File types to monitor")
+	fileTypes := flag.String("types", "go,html,css,js,tmpl", "File types to monitor")
 	flag.Parse()
 
 	// Teardown
