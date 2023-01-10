@@ -24,4 +24,4 @@ Gomon monitors your project directory and runs commands if it detects changes.
         Custom run command (default "./__temp__")
 ```
 
-Only the file types defined in `types` (default `go, htmp, css, js, hmpl`) are monitored. At startup the `setup` command and the `update` command run once. After every detected file change the update command is stopped if still running and restarted. When the programm stops the `teardown` command is run once.
+Only the file types defined in `types` (default `go, html, css, js, tmpl`) are monitored. At startup the `setup` command and the `update` command run once. After every detected file change the update command is stopped if still running and restarted. When the programm stops the `teardown` command is run once.
