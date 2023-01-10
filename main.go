@@ -1,7 +1,7 @@
 package main
 
 import (
-	"crypto/md5"
+	"context"
 	"flag"
 	"fmt"
 	"io/fs"
@@ -16,114 +16,147 @@ import (
 	"time"
 )
 
-var m = make(map[string][16]byte)
-
-func errorHandling(err error) {
-	if err != nil {
-		log.Fatalf("Fatal Error: %s", err)
-	}
+type Program struct {
+	newFiles      []*File
+	oldFiles      []*File
+	root          string
+	pattern       string
+	setupCMD      string
+	updateCMD     string
+	updateContext context.Context
+	teardownCMD   string
+	interval      int
+	debug         bool
 }
 
-func getAllFiles(root string) []string {
-	var files []string
-	filepath.Walk(root, func(path string, info fs.FileInfo, err error) error {
-		errorHandling(err)
-		if !info.IsDir() {
-			files = append(files, path)
+type File struct {
+	path      string
+	timestamp int64
+}
+
+func (p *Program) getFiles() []*File {
+	p.newFiles = make([]*File, 0)
+	filepath.Walk(p.root, func(path string, info fs.FileInfo, err error) error {
+		if err != nil {
+			panic("error walking files")
+		}
+		if !info.IsDir() && p.isWatchFile(path) {
+			p.newFiles = append(p.newFiles, &File{path: path, timestamp: modTime(path)})
 		}
 		return nil
 	})
-	return files
+	return p.newFiles
 }
 
-func getWatchFiles(root string, pattern string) []string {
-	var files []string
-	re := regexp.MustCompile(pattern)
-	for _, file := range getAllFiles(root) {
-		if re.Match([]byte(file)) {
-			files = append(files, file)
-		}
-	}
-	return files
+func (p *Program) isWatchFile(path string) bool {
+	re := regexp.MustCompile(p.pattern)
+	return re.Match([]byte(path))
 }
 
-func fileContenHash(path string) [16]byte {
-	content, err := os.ReadFile(path)
-	errorHandling(err)
-	return md5.Sum(content)
+func (p *Program) setup() {
+	p.log(fmt.Sprintf("Run setup command -- %s", p.setupCMD))
+	cmd := makeCmd(p.setupCMD, context.Background())
+	cmd.Run()
 }
 
-func setup(pattern string) {
-	m = make(map[string][16]byte)
-	files := getWatchFiles(".", pattern)
-	for _, file := range files {
-		m[file] = fileContenHash(file)
-	}
+func (p *Program) update() {
+	p.log(fmt.Sprintf("Run update command -- %s", p.updateCMD))
+	p.updateContext = context.Background()
+	cmd := makeCmd(p.updateCMD, p.updateContext)
+	cmd.Start()
 }
 
-func isEqual(pattern string) bool {
-	files := getWatchFiles(".", pattern)
-	for _, file := range files {
-		val, ok := m[file]
-		if !ok || val != fileContenHash(file) || len(files) != len(m) {
-			return false
-		}
-	}
-	return true
-}
-
-func makeCmd(c string) *exec.Cmd {
-	var cmd *exec.Cmd
-	command := strings.Split(c, " ")
-	if len(command) > 1 {
-		cmd = exec.Command(command[0], command[1:]...)
-	} else if len(command) == 1 {
-		cmd = exec.Command(c)
-	} else {
-		log.Panic("command error", c)
-	}
-	return cmd
-}
-
-func rebuild(build string, run string) *exec.Cmd {
-	buildCmd := makeCmd(build)
-	buildCmd.Run()
-	runCmd := makeCmd(run)
-	runCmd.Stdout = os.Stdout
-	runCmd.Stderr = os.Stderr
-	runCmd.Start()
-	return runCmd
-}
-
-func main() {
-	buildCmd := flag.String("build", "go build -o=__temp__", "Custom build command")
-	runCmd := flag.String("run", "./__temp__", "Custom run command")
-	tearDownCmd := flag.String("tearDown", "rm __temp__", "Custom teardown command")
-	fileTypes := flag.String("types", "go,html,css,js,tmpl", "File types to monitor")
-	flag.Parse()
-
-	// Teardown
+func (p *Program) teardown() {
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, os.Interrupt, os.Kill, syscall.SIGTERM)
 	go func() {
-		signalType := <-ch
+		<-ch
 		signal.Stop(ch)
-		fmt.Println("Exit command received. Exiting...", signalType)
-		cmd := makeCmd(*tearDownCmd)
+		p.log(fmt.Sprintf("Run teardown command -- %s", p.teardownCMD))
+		cmd := makeCmd(p.teardownCMD, context.Background())
 		cmd.Run()
 		os.Exit(0)
 	}()
+}
 
-	pattern := fmt.Sprintf(".+\\.(%s)", strings.ReplaceAll(*fileTypes, ",", "|"))
-	setup(pattern)
-	cmd := rebuild(*buildCmd, *runCmd)
-	for {
-		time.Sleep(time.Second * 1)
-		if !isEqual(pattern) {
-			fmt.Println("Update detected")
-			setup(pattern)
-			cmd.Process.Kill()
-			cmd = rebuild(*buildCmd, *runCmd)
+func (p *Program) isOutOfDate() bool {
+	if len(p.oldFiles) != len(p.newFiles) {
+		return true
+	}
+	for i, file := range p.newFiles {
+		if file.path != p.oldFiles[i].path || file.timestamp != p.oldFiles[i].timestamp {
+			return true
 		}
 	}
+	return false
+}
+
+func (p *Program) run() {
+	p.setup()
+	p.update()
+	p.teardown()
+	p.getFiles()
+	p.oldFiles = p.newFiles
+	for {
+		p.log(fmt.Sprintf("Sleep for %d seconds", p.interval))
+		time.Sleep(time.Second * time.Duration(p.interval))
+		p.getFiles()
+		if p.isOutOfDate() {
+			p.oldFiles = p.newFiles
+			p.log("Detected file change")
+			p.updateContext.Done()
+			p.update()
+		}
+	}
+}
+
+func modTime(path string) int64 {
+	file, err := os.Stat(path)
+	if err != nil {
+		panic("cannot find file")
+	}
+	return file.ModTime().UnixMilli()
+}
+
+func makeCmd(c string, ctx context.Context) *exec.Cmd {
+	var cmd *exec.Cmd
+	command := strings.Split(c, " ")
+	if len(command) > 1 {
+		cmd = exec.CommandContext(ctx, command[0], command[1:]...)
+	} else {
+		cmd = exec.CommandContext(ctx, c)
+	}
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd
+}
+
+func (p *Program) log(s string) {
+	if p.debug {
+		log.Println(s)
+	}
+}
+
+func main() {
+	setup := flag.String("setup", "go build -o=__temp__", "Custom build command")
+	update := flag.String("update", "./__temp__", "Custom run command")
+	teardown := flag.String("teardown", "rm __temp__", "Custom teardown command")
+	fileTypes := flag.String("types", "go,html,css,js,tmpl", "File types to monitor")
+	root := flag.String("root", ".", "Root folder to monitor")
+	debug := flag.Bool("debug", false, "Activates debug logs")
+	flag.Parse()
+
+	pattern := fmt.Sprintf(".+\\.(%s)", strings.ReplaceAll(*fileTypes, ",", "|"))
+	program := &Program{
+		nil,
+		nil,
+		*root,
+		pattern,
+		*setup,
+		*update,
+		context.Background(),
+		*teardown,
+		1,
+		*debug}
+	program.run()
 }
